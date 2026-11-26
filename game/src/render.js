@@ -193,7 +193,14 @@
       ctx.lineTo(x + c[0] * w / 2 - c[0] * L, y + c[1] * h / 2);
       ctx.stroke();
     });
-    text(ctx, locked ? 'LOCK' : 'TRACK', x, y - h / 2 - 22, 13, locked ? '#5cff8f' : '#ff9d9d', 'center');
+    // The floating TRACK/LOCK caption sits just above the bracket — for a
+    // ship target that lands in the ship-label lanes, so it is skipped
+    // there: ships already carry their own HP label, the bracket corners
+    // and the HUD target line carry the lock state, and the caption would
+    // stamp over a label.
+    if (t.kind !== 'boat' && t.kind !== 'depot') {
+      text(ctx, locked ? 'LOCK' : 'TRACK', x, y - h / 2 - 22, 13, locked ? '#5cff8f' : '#ff9d9d', 'center');
+    }
     // Centre pipper.
     ctx.strokeStyle = 'rgba(255,255,255,0.85)';
     ctx.beginPath(); ctx.arc(640, 330, 14, 0, 6.29); ctx.stroke();
@@ -234,8 +241,13 @@
         }
       }
       if (e.kind === 'boat' || e.kind === 'depot') {
-        text(ctx, (e.kind === 'boat' ? 'MISSILE BOAT' : 'FUEL DEPOT') + '  HP ' + Math.max(0, Math.round(e.hp)),
-          e.x, e.y - 60, 12, '#ffd166', 'center');
+        // Ship labels are laid out in lanes by drawShipLabels (no overlaps,
+        // always above the HUD) — collect them here, do not draw inline.
+        (sortie._shipLabels = sortie._shipLabels || []).push({
+          text: (e.kind === 'boat' ? 'MISSILE BOAT' : 'FUEL DEPOT') + '  HP ' +
+            Math.max(0, Math.round(e.hp)),
+          cx: e.x, color: '#ffd166'
+        });
       }
     });
     // Missile smoke trails + missile dots.
@@ -277,39 +289,75 @@
     if (!sortie.fleet) return;
     drawSprite(ctx, 'fleet.png', 640, 640, 560, 78, false);
     sortie.fleet.forEach(function (sh) {
-      // Labels sit just above the ships with a dark backing, clear of the
-      // bottom HUD panels (which start at y=596) and of the ships themselves.
+      // Collect for the lane layout in drawShipLabels — never drawn here,
+      // so a label can never land under a HUD panel or on another label.
+      (sortie._shipLabels = sortie._shipLabels || []).push({
+        text: sh.name + '  ' + (sh.alive ? 'HP ' + Math.round(sh.hp) : 'SUNK'),
+        cx: sh.x, color: sh.alive ? '#7fd4ff' : '#ff6b6b'
+      });
+    });
+  }
+
+  // Ship labels, one per lane: sorted left-to-right, each label takes the
+  // lowest free lane (closest to its ship) whose box clears every label
+  // already placed. Every lane sits fully above the bottom HUD panels
+  // (which start at y=596) and every box is clamped inside the frame.
+  function drawShipLabels(ctx, sortie) {
+    var labels = sortie._shipLabels || [];
+    if (!labels.length) return;
+    var lanes = [566, 538, 510, 482, 454, 426, 398, 370];
+    var placed = [];
+    ctx.font = 'bold 12px "Segoe UI", Arial, sans-serif';
+    labels.sort(function (a, b) { return a.cx - b.cx; });
+    labels.forEach(function (lb) {
+      var w = Math.ceil(ctx.measureText(lb.text).width) + 16;
+      var cx = Math.max(w / 2 + 8, Math.min(W - w / 2 - 8, lb.cx));
+      var x0 = cx - w / 2, x1 = cx + w / 2, y = lanes[lanes.length - 1];
+      for (var i = 0; i < lanes.length; i++) {
+        var clash = placed.some(function (p) {
+          return p.y === lanes[i] && x0 < p.x1 + 6 && x1 > p.x0 - 6;
+        });
+        if (!clash) { y = lanes[i]; break; }
+      }
+      placed.push({ x0: x0, x1: x1, y: y });
       ctx.fillStyle = 'rgba(6,14,24,0.65)';
-      ctx.fillRect(sh.x - 100, sh.y - 80, 200, 18);
-      text(ctx, sh.name + '  ' + (sh.alive ? 'HP ' + Math.round(sh.hp) : 'SUNK'),
-        sh.x, sh.y - 78, 12, sh.alive ? '#7fd4ff' : '#ff6b6b', 'center');
+      ctx.fillRect(x0, y, w, 18);
+      text(ctx, lb.text, cx, y + 2, 12, lb.color, 'center');
     });
   }
 
   function flight(ctx, sortie) {
     var m = sortie.mission;
+    sortie._shipLabels = []; // rebuilt every frame by drawFleet/drawEnemies
     if (sortie.camera === 'cockpit') {
-      bg(ctx, 'cockpit-bg.jpg');
-      // The world ahead, seen through the canopy window, scaled into it.
-      ctx.save();
-      ctx.beginPath(); ctx.rect(300, 60, 680, 300); ctx.clip();
-      ctx.translate(300, 60);
-      ctx.scale(680 / 1280, 300 / 720);
-      var im = IMG[m.bg];
-      if (im) ctx.drawImage(im, 0, 0, 1280, 720);
+      // The canopy is a window onto the world, not a TV screen: the mission
+      // scene goes FULL-BLEED across the whole frame first, then the cockpit
+      // photo is laid over it only where the cockpit itself is — panel at
+      // the bottom, frame strips at the top and sides. Enemies and the
+      // explosion are drawn in full-frame coordinates, so they sit inside
+      // the canopy opening like real bandits ahead of the jet.
+      bg(ctx, m.bg);
       drawEnemies(ctx, sortie);
       lockBracket(ctx, sortie);
-      ctx.restore();
-      // Canopy frame + glowing panel strip at the bottom of the cockpit photo.
-      ctx.strokeStyle = 'rgba(20,30,40,0.9)'; ctx.lineWidth = 26;
-      ctx.strokeRect(0, 0, W, H);
-      panel(ctx, 0, 660, W, 60, 0.6);
-      text(ctx, 'COCKPIT VIEW — V toggles chase view · canopy frame live', 24, 682, 13, '#9fd0ff');
+      var cp = IMG['cockpit-bg.jpg'];
+      if (cp) {
+        // Instrument panel + stick: the bottom ~45% of the cockpit photo,
+        // drawn at the same scale and position as in the photo.
+        ctx.drawImage(cp, 0, 396, W, H - 396, 0, 396, W, H - 396);
+        // Canopy frame edges: top arch strip + left/right frame strips.
+        // The photo's left arch leg is a thick diagonal band, so the left
+        // strip is wide; the right side of the photo is open sky, so the
+        // right strip stays narrow.
+        ctx.drawImage(cp, 0, 0, W, 56, 0, 0, W, 56);
+        ctx.drawImage(cp, 0, 0, 160, H, 0, 0, 160, H);
+        ctx.drawImage(cp, W - 72, 0, 72, H, W - 72, 0, 72, H);
+      }
     } else {
       bg(ctx, m.bg);
       drawFleet(ctx, sortie);
       drawSprite(ctx, 'jet-player.png', sortie.playerX, sortie.playerY, 210, 112, false);
       drawEnemies(ctx, sortie);
+      drawShipLabels(ctx, sortie);
       // Storm weather: rain streaks + lightning flash wash.
       if (m.weather === 'storm') {
         ctx.strokeStyle = 'rgba(200,220,255,0.5)'; ctx.lineWidth = 1;
@@ -402,7 +450,8 @@
   function hangarScreen(ctx, game) {
     var run = window.RF_RUN, s = run.stats;
     bg(ctx, 'hangar-bg.jpg');
-    drawSprite(ctx, 'jet-player.png', 330, 300, 420, 224, false);
+    // No player-jet sprite here: the hangar photo already has the F-16 as
+    // its hero — a second jet pasted on top reads as two jets in one spot.
     panel(ctx, 20, 20, 620, 60, 0.82);
     text(ctx, 'HANGAR — KESTREL DECK', 36, 32, 26, '#ffffff');
     text(ctx, 'CHIEF GUS: "She is fuelled and ready, kid. Spend wisely — my prices are fair."', 36, 62, 13, '#ff9d7a');
